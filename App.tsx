@@ -54,6 +54,10 @@ const App: React.FC = () => {
   // Analysis state
   const [expandedWords, setExpandedWords] = useState<Set<string>>(new Set());
   const [selectedWordsForNegative, setSelectedWordsForNegative] = useState<Set<string>>(new Set());
+  const [analysisSortMode, setAnalysisSortMode] = useState<'count' | 'alpha'>('count');
+  const [analysisGrouping, setAnalysisGrouping] = useState(false);
+  const [showNegativeConfirm, setShowNegativeConfirm] = useState(false);
+  const [negativesToConfirm, setNegativesToConfirm] = useState<{word: string, checked: boolean}[]>([]);
   
   // Bulk add state
   const [bulkInput, setBulkInput] = useState('');
@@ -394,17 +398,37 @@ const App: React.FC = () => {
   const handleNegativeWordsFromAnalysis = () => {
     if (selectedWordsForNegative.size === 0) return;
     
-    const wordsToMinus: string[] = [...selectedWordsForNegative];
-    
-    updateProject(p => {
-        // Find existing negatives specifically in the CURRENT project
-        const existingNegatives = new Set(p.keywords.filter(k => k.isNegative).map(k => k.text.toLowerCase().trim()));
-        
-        const uniqueWordsToMinus = wordsToMinus.filter(word => !existingNegatives.has(word.toLowerCase().trim()));
+    // Expand selected labels back to full words if grouping is on
+    const wordsToMinus = new Set<string>();
+    wordAnalysisMap.forEach(({ label, words }) => {
+      if (selectedWordsForNegative.has(label)) {
+        words.forEach(w => wordsToMinus.add(w));
+      }
+    });
 
+    const existingNegatives = new Set(currentProject?.keywords.filter(k => k.isNegative).map(k => k.text.toLowerCase().trim()) || []);
+    const uniqueWords = Array.from(wordsToMinus).filter(w => !existingNegatives.has(w.toLowerCase().trim()));
+    
+    if (uniqueWords.length === 0) {
+      alert("Все выбранные слова уже есть в списке минус-слов.");
+      return;
+    }
+
+    setNegativesToConfirm(uniqueWords.map(w => ({ word: w, checked: true })));
+    setShowNegativeConfirm(true);
+  };
+
+  const confirmNegativeWords = () => {
+    const finalWords = negativesToConfirm.filter(n => n.checked).map(n => n.word);
+    if (finalWords.length === 0) {
+      setShowNegativeConfirm(false);
+      return;
+    }
+
+    updateProject(p => {
         const targetNegGroupId = activeNegativeGroupId || (p.negativeGroups.length > 0 ? p.negativeGroups[0].id : null);
 
-        const newNegativeKeywords: Keyword[] = uniqueWordsToMinus.map((word: string) => ({
+        const newNegativeKeywords: Keyword[] = finalWords.map((word: string) => ({
             id: Math.random().toString(36).substr(2, 9),
             text: word,
             status: 'parsed',
@@ -422,9 +446,9 @@ const App: React.FC = () => {
     });
 
     setSelectedWordsForNegative(new Set());
-    setSelection(new Set());
+    setShowNegativeConfirm(false);
     setShowAnalysis(false);
-    alert(`Слова добавлены в список минус-слов.`);
+    alert(`Слова (${finalWords.length}) добавлены в список минус-слов.`);
   };
 
   const deleteKeywordsPermanently = () => {
@@ -532,28 +556,97 @@ const App: React.FC = () => {
     setExpandedGroups(next);
   };
 
-  const wordAnalysisMap = useMemo((): [string, string[]][] => {
-    const map: Record<string, string[]> = {};
+  const getStem = (word: string): string => {
+    if (word.length <= 4) return word;
+    // Very basic Russian stemmer (removes common endings)
+    return word.replace(/(ий|ый|ое|ая|ие|ые|ов|ам|ами|ах|ом|е|и|у|а|я|ь|ы|о|иям|иями|иях)$/, '');
+  };
+
+  const wordAnalysisMap = useMemo((): { label: string, words: string[], ids: string[] }[] => {
+    const wordToIds: Record<string, string[]> = {};
     const parsed = filteredKeywords('parsed');
+    
     parsed.forEach((k: Keyword) => {
       const words = k.text.toLowerCase().split(/[^a-zа-я0-9]/).filter(w => w.length > 1);
       Array.from(new Set(words)).forEach((w: string) => {
-        if (!map[w]) map[w] = [];
-        map[w].push(k.id);
+        if (!wordToIds[w]) wordToIds[w] = [];
+        wordToIds[w].push(k.id);
       });
     });
-    return Object.entries(map).sort((a, b) => b[1].length - a[1].length);
-  }, [currentProject?.keywords, searchQuery, filteredKeywords]);
 
-  const toggleWordSelectionGroup = (word: string, ids: string[]) => {
+    let result: { label: string, words: string[], ids: string[] }[] = [];
+
+    if (analysisGrouping) {
+      const stemMap: Record<string, { words: Set<string>, ids: Set<string> }> = {};
+      Object.entries(wordToIds).forEach(([word, ids]) => {
+        const stem = getStem(word);
+        if (!stemMap[stem]) {
+          stemMap[stem] = { words: new Set(), ids: new Set() };
+        }
+        stemMap[stem].words.add(word);
+        ids.forEach(id => stemMap[stem].ids.add(id));
+      });
+
+      result = Object.entries(stemMap).map(([stem, data]) => {
+        const wordsArray = Array.from(data.words);
+        // Use the word with most IDs as the label, or the shortest one if tied
+        const label = wordsArray.sort((a, b) => {
+          const aCount = wordToIds[a].length;
+          const bCount = wordToIds[b].length;
+          if (aCount !== bCount) return bCount - aCount;
+          return a.length - b.length;
+        })[0];
+
+        return {
+          label: label,
+          words: wordsArray,
+          ids: Array.from(data.ids)
+        };
+      });
+    } else {
+      result = Object.entries(wordToIds).map(([word, ids]) => ({
+        label: word,
+        words: [word],
+        ids: ids
+      }));
+    }
+
+    return result.sort((a, b) => {
+      if (analysisSortMode === 'count') {
+        return b.ids.length - a.ids.length;
+      }
+      return a.label.localeCompare(b.label);
+    });
+  }, [currentProject?.keywords, searchQuery, filteredKeywords, analysisGrouping, analysisSortMode]);
+
+  const toggleWordSelectionGroup = (label: string, ids: string[], words: string[]) => {
     const nextWords = new Set(selectedWordsForNegative);
     const nextSelection = new Set(selection);
     
-    if (nextWords.has(word)) {
-        nextWords.delete(word);
-        ids.forEach(id => nextSelection.delete(id));
+    if (nextWords.has(label)) {
+        nextWords.delete(label);
+        // Remove IDs only if they don't contain other selected words (by group)
+        ids.forEach(id => {
+            const k = currentProject?.keywords.find(item => item.id === id);
+            if (k) {
+                const kWords = k.text.toLowerCase().split(/[^a-zа-я0-9]/).filter(w => w.length > 1);
+                const stillHasSelectedWord = kWords.some(w => {
+                  // Find if this word's group is still selected
+                  const stem = getStem(w);
+                  return Array.from(nextWords).some((selectedLabel: string) => {
+                    // If grouping is off, selectedLabel is just the word
+                    if (!analysisGrouping) return selectedLabel === w;
+                    // If grouping is on, check if the word belongs to the selected group (label)
+                    return getStem(selectedLabel) === getStem(w);
+                  });
+                });
+                if (!stillHasSelectedWord) {
+                    nextSelection.delete(id);
+                }
+            }
+        });
     } else {
-        nextWords.add(word);
+        nextWords.add(label);
         ids.forEach(id => nextSelection.add(id));
     }
     
@@ -1074,26 +1167,73 @@ const App: React.FC = () => {
                       <p className="text-[10px] text-indigo-400 uppercase font-black tracking-[0.2em]">Разбивка фраз на леммы</p>
                    </div>
                 </div>
-                <button onClick={() => { setShowAnalysis(false); setSelection(new Set()); setSelectedWordsForNegative(new Set()); }} className="p-2 hover:bg-indigo-50 text-indigo-500 rounded-full transition-colors"><X size={28} /></button>
+                <button onClick={() => { setShowAnalysis(false); setSelectedWordsForNegative(new Set()); }} className="p-2 hover:bg-indigo-50 text-indigo-500 rounded-full transition-colors"><X size={28} /></button>
+             </div>
+             
+             <div className="px-8 py-4 bg-slate-50/50 border-b border-slate-100 flex items-center gap-6 shrink-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider">Сортировка:</span>
+                  <div className="flex bg-white p-1 rounded-lg border border-slate-200">
+                    <button 
+                      onClick={() => setAnalysisSortMode('count')}
+                      className={`px-3 py-1 text-[9px] font-black uppercase rounded-md transition-all ${analysisSortMode === 'count' ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}
+                    >
+                      По вхождениям
+                    </button>
+                    <button 
+                      onClick={() => setAnalysisSortMode('alpha')}
+                      className={`px-3 py-1 text-[9px] font-black uppercase rounded-md transition-all ${analysisSortMode === 'alpha' ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}
+                    >
+                      А-Я
+                    </button>
+                  </div>
+                </div>
+                
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider">Группировка:</span>
+                  <button 
+                    onClick={() => {
+                      setAnalysisGrouping(!analysisGrouping);
+                      setSelectedWordsForNegative(new Set());
+                      setSelection(new Set());
+                    }}
+                    className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border transition-all ${analysisGrouping ? 'bg-indigo-50 border-indigo-200 text-indigo-600' : 'bg-white border-slate-200 text-slate-400'}`}
+                  >
+                    <div className={`w-3 h-3 rounded-sm border flex items-center justify-center transition-all ${analysisGrouping ? 'bg-indigo-600 border-indigo-600' : 'border-slate-300'}`}>
+                      {analysisGrouping && <Check size={8} className="text-white" strokeWidth={4} />}
+                    </div>
+                    <span className="text-[9px] font-black uppercase">Похожие слова</span>
+                  </button>
+                </div>
              </div>
              
              <div className="flex-1 overflow-y-auto bg-white custom-scrollbar divide-y divide-slate-100">
-                {wordAnalysisMap.map(([word, ids]) => {
-                  const isExpanded = expandedWords.has(word);
-                  const isWordSelected = selectedWordsForNegative.has(word);
+                {wordAnalysisMap.map(({ label, words, ids }) => {
+                  const isExpanded = expandedWords.has(label);
+                  const isWordSelected = selectedWordsForNegative.has(label);
                   
                   return (
-                    <div key={word} className="transition-all overflow-hidden bg-white">
+                    <div key={label} className="transition-all overflow-hidden bg-white">
                       <div className="flex items-center py-0.5 px-3 hover:bg-slate-50 transition-colors">
                         <input 
                           type="checkbox" 
                           checked={isWordSelected}
-                          onChange={() => toggleWordSelectionGroup(word, ids)}
+                          onChange={() => toggleWordSelectionGroup(label, ids, words)}
                           className="mr-2 h-4 w-4 rounded-md border-slate-300 text-indigo-600 cursor-pointer"
                         />
-                        <div className="flex-1 flex items-center gap-2 cursor-pointer py-0.5" onClick={() => toggleWordExpand(word)}>
-                          <span className="text-[11px] font-bold text-slate-700 capitalize tracking-tight">{word}</span>
+                        <div className="flex-1 flex items-center gap-2 cursor-pointer py-0.5" onClick={() => toggleWordExpand(label)}>
+                          <span className="text-[11px] font-bold text-slate-700 capitalize tracking-tight">
+                            {label}
+                          </span>
                           <span className="text-[9px] text-slate-400 font-medium tracking-tighter italic">({ids.length} вх.)</span>
+                          {analysisGrouping && (
+                            <div className="flex gap-1 overflow-hidden">
+                              {words.slice(0, 3).map(w => (
+                                <span key={w} className="text-[8px] bg-slate-100 text-slate-500 px-1 rounded uppercase font-bold">{w}</span>
+                              ))}
+                              {words.length > 3 && <span className="text-[8px] text-slate-300">...</span>}
+                            </div>
+                          )}
                         </div>
                         {isExpanded ? <ChevronDown size={14} className="text-slate-300 ml-auto" /> : <ChevronRight size={14} className="text-slate-300 ml-auto" />}
                       </div>
@@ -1159,6 +1299,59 @@ const App: React.FC = () => {
                   </button>
                 </div>
              </div>
+          </div>
+        </div>
+      )}
+
+      {/* Negative Confirmation Modal */}
+      {showNegativeConfirm && (
+        <div className="fixed inset-0 bg-slate-900/80 backdrop-blur-sm z-[120] flex items-center justify-center p-4">
+          <div className="bg-white rounded-[2rem] w-full max-w-md shadow-2xl flex flex-col overflow-hidden animate-in zoom-in-95">
+            <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-red-50/30 shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-red-600 text-white rounded-xl shadow-lg shadow-red-100"><MinusSquare size={20} /></div>
+                <h2 className="text-lg font-black text-slate-900 uppercase tracking-tight">Подтверждение</h2>
+              </div>
+              <button onClick={() => setShowNegativeConfirm(false)} className="p-2 hover:bg-red-50 text-red-500 rounded-full transition-colors"><X size={20} /></button>
+            </div>
+            
+            <div className="p-6 flex-1 overflow-y-auto max-h-[50vh] custom-scrollbar">
+              <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest mb-4">Выберите слова для добавления в минус-список:</p>
+              <div className="space-y-2">
+                {negativesToConfirm.map((item, idx) => (
+                  <label key={idx} className="flex items-center p-3 rounded-xl border border-slate-100 hover:bg-slate-50 transition-all cursor-pointer group">
+                    <input 
+                      type="checkbox" 
+                      checked={item.checked}
+                      onChange={() => {
+                        const next = [...negativesToConfirm];
+                        next[idx].checked = !next[idx].checked;
+                        setNegativesToConfirm(next);
+                      }}
+                      className="h-4 w-4 rounded border-slate-300 text-red-600 focus:ring-red-500"
+                    />
+                    <span className={`ml-3 text-xs font-bold transition-colors ${item.checked ? 'text-red-600' : 'text-slate-400 line-through'}`}>
+                      {item.word}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="p-6 bg-slate-50 border-t border-slate-100 flex gap-3">
+              <button 
+                onClick={() => setShowNegativeConfirm(false)}
+                className="flex-1 py-3.5 bg-white border border-slate-200 text-slate-600 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-100 transition-all"
+              >
+                Отмена
+              </button>
+              <button 
+                onClick={confirmNegativeWords}
+                className="flex-1 py-3.5 bg-red-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-red-100 hover:bg-red-700 transition-all"
+              >
+                Добавить ({negativesToConfirm.filter(n => n.checked).length})
+              </button>
+            </div>
           </div>
         </div>
       )}
